@@ -1,194 +1,166 @@
-# prediction_function.py
-import os
-import io
-import torch
-import numpy as np
 import pandas as pd
+import numpy as np
+import torch
 from sklearn.preprocessing import StandardScaler
-from sklearn.neighbors import NearestNeighbors
-from sklearn.ensemble import IsolationForest
+from scipy.sparse import csr_matrix
+from torch_geometric.data import Data
 import torch.nn.functional as F
+from torch.nn import Linear, Dropout
+from torch_geometric.nn import GCNConv
+import warnings
 
-# Optional import for torch_geometric — only required if GNN model is used.
-try:
-    from torch_geometric.data import Data
-except Exception:
-    Data = None  # we'll check before using
+# Ignore specific warnings from scikit-learn
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
-# ---------- Helpers ----------
-def _standardize_df(df, numeric_cols=None):
-    """Return scaled numpy array and column names."""
-    if numeric_cols is None:
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    X = df[numeric_cols].fillna(0.).astype(float).values
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    return X_scaled, numeric_cols, scaler
+# Define the GCN model class (must match the trained model)
+class GCN(torch.nn.Module):
+    def __init__(self, num_node_features, hidden_channels, num_classes):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(num_node_features, hidden_channels)
+        self.dropout1 = Dropout(0.5)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.dropout2 = Dropout(0.5)
+        self.conv3 = GCNConv(hidden_channels, hidden_channels)
+        self.dropout3 = Dropout(0.5)
+        self.lin = Linear(hidden_channels, num_classes)
 
-def _build_knn_graph(X, k=5):
-    """Return edge_index for torch_geometric from k-NN graph on X (n_samples x n_features)."""
-    nbrs = NearestNeighbors(n_neighbors=min(k+1, X.shape[0]), algorithm='auto').fit(X)
-    distances, indices = nbrs.kneighbors(X)
-    # build edges: for each i, connect to indices[i, 1:]
-    src = []
-    dst = []
-    for i in range(indices.shape[0]):
-        for j in range(1, indices.shape[1]):  # skip self at position 0
-            src.append(i)
-            dst.append(indices[i, j])
-    # convert to torch tensor edge_index shape [2, num_edges]
-    edge_index = torch.tensor([src + dst, dst + src], dtype=torch.long)  # make undirected by duplicating
-    return edge_index
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = x.relu()
+        x = self.dropout1(x)
+        x = self.conv2(x, edge_index)
+        x = x.relu()
+        x = self.dropout2(x)
+        x = self.conv3(x, edge_index)
+        x = x.relu()
+        x = self.dropout3(x)
+        out = self.lin(x)
+        return out
 
-def _try_load_model(model_path, map_location='cpu'):
-    """Try loading a model in a flexible way:
-       - Try torch.jit.load (scripted model)
-       - Try torch.load, and if it's an nn.Module return it, if state_dict return that
+
+def predict_fraud(new_data_df, model_path="gcn_correlation_smote_model.pth", correlation_threshold=0.5):
     """
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    # 1) Try torch.jit.load
-    try:
-        scripted = torch.jit.load(model_path, map_location=map_location)
-        scripted.eval()
-        return scripted
-    except Exception:
-        pass
-
-    # 2) Try torch.load
-    loaded = torch.load(model_path, map_location=map_location)
-    # If the object is a Module (saved with torch.save(model)), return it
-    if isinstance(loaded, torch.nn.Module):
-        loaded.eval()
-        return loaded
-    # Otherwise the loaded object may be a state_dict
-    if isinstance(loaded, dict):
-        # Heuristic: check if keys look like state_dict keys
-        some_keys = list(loaded.keys())[:5]
-        if all(isinstance(k, str) for k in some_keys):
-            # It's likely a state_dict; return the dict so the caller can handle it
-            return loaded
-    # Otherwise return what we got
-    return loaded
-
-# ---------- Main prediction function ----------
-def predict_from_dataframe(df,
-                           model_path=None,
-                           use_gnn=True,
-                           knn_k=5,
-                           threshold=0.5,
-                           device='cpu'):
-    """
-    Predict fraud on a dataframe of transactions.
+    Predict fraud for new transaction data using the trained GCN model
+    with a correlation-based graph.
 
     Args:
-        df (pd.DataFrame): Input transaction dataframe (columns should be numeric features used by model).
-        model_path (str or None): Path to .pth/.pt model file. If None or loading fails, an IsolationForest fallback is used.
-        use_gnn (bool): Whether to attempt GNN prediction. If False, directly uses IsolationForest.
-        knn_k (int): number of neighbors for graph construction when using GNN.
-        threshold (float 0..1): probability threshold to label as 'Fraud'.
-        device (str): 'cpu' or 'cuda' (if available and model supports it).
+        new_data_df (pd.DataFrame): DataFrame containing the new transaction data.
+                                    Must have the same columns as the training data (excluding 'Class').
+        model_path (str): Path to the saved model state dictionary.
+                          Defaults to "gcn_correlation_smote_model.pth".
+        correlation_threshold (float): Correlation threshold used for graph construction.
+                                       Defaults to 0.5.
 
     Returns:
-        pd.DataFrame: original df with added columns:
-            - Fraud_Probability: [0..1] (higher => more likely fraud)
-            - Prediction_Label: 'Fraud'/'Not Fraud'
+        pd.DataFrame: DataFrame with original data, predicted class labels (0/1),
+                      and prediction probabilities for the fraud class.
+                      Returns None if model loading fails.
     """
-    if df is None or df.empty:
-        raise ValueError("Input dataframe is empty")
+    print("Starting fraud prediction...")
 
-    # 1) pick numeric columns (user data may have non-numeric like IDs/time; keep numeric features)
-    X_scaled, numeric_cols, scaler = _standardize_df(df)
-    n_nodes = X_scaled.shape[0]
+    processed_data_df = new_data_df.copy()
 
-    # 2) Try to load model if requested
-    model = None
-    state_dict = None
-    if use_gnn and model_path is not None:
+    expected_columns = [f'V{i}' for i in range(1, 29)] + ['Time', 'Amount']
+    if not all(col in processed_data_df.columns for col in expected_columns):
+        print("Error: Input DataFrame does not have the expected columns.")
+        return None
+
+    # --- Preprocessing ---
+    data_for_scaling = processed_data_df.copy()
+    for col in data_for_scaling.columns:
+        # Calculate IQR only if the column exists in the dataframe
+        if col in data_for_scaling.columns:
+            Q1 = data_for_scaling[col].quantile(0.25)
+            Q3 = data_for_scaling[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            data_for_scaling[col] = np.where(data_for_scaling[col] < lower_bound, lower_bound, data_for_scaling[col])
+            data_for_scaling[col] = np.where(data_for_scaling[col] > upper_bound, upper_bound, data_for_scaling[col])
+
+
+    # Scale features (using a new scaler fitted only on the new data for simplicity)
+    scaler = StandardScaler()
+    X_new_scaled = scaler.fit_transform(data_for_scaling)
+    X_new_scaled = pd.DataFrame(X_new_scaled, columns=data_for_scaling.columns)
+
+    # --- Drop 'Time' column before graph construction and model initialization ---
+    if 'Time' in X_new_scaled.columns:
+        X_new_scaled = X_new_scaled.drop('Time', axis=1)
+
+
+    # --- Graph Construction  ---
+    # Calculate the correlation matrix between features of the new data
+    # Use a smaller subset for correlation calculation if the dataset is very large
+    subset_for_corr = X_new_scaled.sample(n=min(10000, len(X_new_scaled)), random_state=42) if len(X_new_scaled) > 10000 else X_new_scaled
+    correlation_matrix_new = subset_for_corr.corr()
+
+
+    # Create adjacency matrix using the correlation threshold
+    adj_matrix_correlation_new = (np.abs(correlation_matrix_new) > correlation_threshold).astype(int)
+
+    # Remove self-loops (diagonal elements)
+    np.fill_diagonal(adj_matrix_correlation_new.values, 0)
+
+    # Convert adjacency matrix to a sparse representation
+    adj_matrix_sparse_new = csr_matrix(adj_matrix_correlation_new)
+
+    edge_index_new = torch.tensor(adj_matrix_sparse_new.nonzero(), dtype=torch.long)
+
+    # Convert features to PyTorch tensor
+    x_new_tensor = torch.tensor(X_new_scaled.values, dtype=torch.float)
+
+    # Create PyTorch Geometric Data object
+    data_new = Data(x=x_new_tensor, edge_index=edge_index_new)
+
+    # --- Model Loading and Prediction ---
+    # Check if CUDA is available, otherwise use CPU
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    num_node_features = X_new_scaled.shape[1]
+    hidden_channels = 64 # Based on previous experiments
+    num_classes = 2 # Binary classification (Fraud/Non-Fraud)
+
+    model = GCN(num_node_features=num_node_features, hidden_channels=hidden_channels, num_classes=num_classes).to(device)
+
+    # Load the saved model state dictionary
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()  # Set the model to evaluation mode
+    except FileNotFoundError:
+        print(f"Error: Model file not found at {model_path}. Please ensure the model was saved correctly.")
+        # Attempt to load from Colab files if in Colab environment and file not found locally
         try:
-            loaded = _try_load_model(model_path, map_location=device)
-            if isinstance(loaded, dict):
-                # state_dict: We cannot reconstruct model architecture automatically
-                state_dict = loaded
-                model = None
-            elif isinstance(loaded, torch.nn.Module):
-                model = loaded.to(device)
-            else:
-                # unknown object loaded (e.g., a dict with more metadata)
-                # try to find a model inside
-                if hasattr(loaded, 'state_dict'):
-                    try:
-                        loaded.eval()
-                        model = loaded.to(device)
-                    except Exception:
-                        model = None
-        except Exception as e:
-            model = None
-
-    # 3) If we have a GNN model and torch_geometric available, construct graph and run inference
-    probs = None
-    used_method = None
-    if model is not None and Data is not None:
-        try:
-            # Build kNN graph
-            edge_index = _build_knn_graph(X_scaled, k=knn_k).to(device)
-
-            # Construct node features: use scaled features as torch.float
-            x = torch.tensor(X_scaled, dtype=torch.float32, device=device)
-
-            # Create PyG Data object
-            pyg_data = Data(x=x, edge_index=edge_index)
-
+            from google.colab import files
+            print(f"Attempting to load from Colab files: {model_path}")
+            model.load_state_dict(torch.load(model_path, map_location=device))
             model.eval()
-            with torch.no_grad():
-                # Support models that accept either (x, edge_index) or a single data object
-                try:
-                    out = model(pyg_data.x, pyg_data.edge_index)
-                except TypeError:
-                    try:
-                        out = model(pyg_data)
-                    except Exception as e:
-                        raise RuntimeError(f"Model call failed: {e}")
-
-                # If output has shape (N, C), convert to probability of class 1
-                if out is None:
-                    raise RuntimeError("Model returned None")
-                out_cpu = out.cpu()
-                if out_cpu.dim() == 2 and out_cpu.size(1) >= 2:
-                    # assume binary classification; take softmax prob for class 1
-                    probs_tensor = F.softmax(out_cpu, dim=1)[:, 1]
-                    probs = probs_tensor.numpy()
-                else:
-                    # single-output regression/logit - apply sigmoid
-                    probs = torch.sigmoid(out_cpu.view(-1)).numpy()
-
-            used_method = 'gnn'
+        except ImportError:
+             print("Not in Google Colab environment. Please ensure the model file is accessible at the specified path.")
+             return None
+        except FileNotFoundError:
+             print(f"Model file still not found after attempting to load from Colab files: {model_path}")
+             return None
         except Exception as e:
-            # If anything fails during GNN inference, we'll fallback
-            print(f"[predict_from_dataframe] GNN inference failed: {e}")
-            probs = None
+             print(f"Error loading model from Colab files: {e}")
+             return None
+    except Exception as e:
+        print(f"Error loading model state dictionary: {e}")
+        return None
 
-    # 4) If GNN wasn't usable, fallback to IsolationForest unsupervised anomaly scoring
-    if probs is None:
-        # IsolationForest expects 2D numeric input; we already have X_scaled
-        iso = IsolationForest(n_estimators=200, contamination='auto', random_state=42)
-        iso.fit(X_scaled)
-        # anomaly score: lower = more abnormal. `score_samples` gives higher = more normal.
-        scores = iso.score_samples(X_scaled)  # higher => normal; lower => anomalous
-        # convert to 0..1 "fraud probability" by flipping and min-max scaling
-        scores_min = scores.min()
-        scores_max = scores.max() if scores.max() != scores.min() else scores_min + 1e-6
-        norm = (scores_max - scores) / (scores_max - scores_min)
-        # clamp
-        norm = np.clip(norm, 0.0, 1.0)
-        probs = norm
-        used_method = 'isolation_forest'
+    # Perform inference
+    with torch.no_grad():
+        # Move data to the same device as the model
+        data_new = data_new.to(device)
+        out = model(data_new.x, data_new.edge_index)
+        probabilities = F.softmax(out, dim=1)
+        predictions = torch.argmax(probabilities, dim=1)
 
-    # 5) Form output dataframe
-    out_df = df.copy().reset_index(drop=True)
-    out_df['Fraud_Probability'] = np.round(probs.astype(float), 6)
-    out_df['Prediction_Label'] = np.where(out_df['Fraud_Probability'] >= float(threshold), 'Fraud', 'Not Fraud')
-    out_df['Model_Method'] = used_method
+    print("Fraud prediction finished.")
 
-    return out_df, {'used_method': used_method, 'numeric_cols': numeric_cols}
+    # Add predictions and probabilities back to the original DataFrame
+    processed_data_df['Predicted_Class'] = predictions.cpu().numpy()
+    processed_data_df['Fraud_Probability'] = probabilities.cpu().numpy()[:, 1]
+
+
+    return processed_data_df

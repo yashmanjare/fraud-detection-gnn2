@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from prediction_function import predict_from_dataframe
+# Import the correct function name
+from prediction_function import predict_fraud
 
 # --- Streamlit Page Config ---
 st.set_page_config(
@@ -43,7 +44,7 @@ h1, h2, h3 {
     background-color: white;
     border-radius: 15px;
     padding: 1.2rem;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    box_shadow: 0 2px 8px rgba(0,0,0,0.05);
     text-align: center;
 }
 .metric-value {
@@ -67,16 +68,6 @@ uploaded_file = st.file_uploader("📂 Upload Transaction CSV File", type=["csv"
 # --- Default model path ---
 model_path = "gcn_correlation_smote_model.pth"
 
-# --- Sample CSV download ---
-sample_data = pd.DataFrame({
-    "amount": [120.0, 5600.0, 23.5, 400.0],
-    "time_seconds": [1000, 200000, 25000, 3600],
-    "feature_a": [0.1, -1.2, 0.3, 0.0],
-    "feature_b": [1, 0, 1, 1]
-})
-st.download_button("📄 Download Sample CSV", sample_data.to_csv(index=False).encode("utf-8"),
-                   "sample_transactions.csv", "text/csv")
-
 # --- Process the Uploaded CSV ---
 if uploaded_file is not None:
     try:
@@ -91,26 +82,31 @@ if uploaded_file is not None:
     if st.button("🚀 Run Fraud Detection", use_container_width=True):
         with st.spinner("Analyzing transactions..."):
             try:
-                out_df, meta = predict_from_dataframe(
+                # Call the correct prediction function and handle its return value
+                # predict_fraud returns a DataFrame with original data + predictions
+                out_df = predict_fraud(
                     df,
                     model_path=model_path,
-                    use_gnn=True,
-                    knn_k=5,
-                    threshold=0.5,
-                    device='cpu'
                 )
+
+                if out_df is None:
+                     st.error("⚠️ Prediction failed. Please check the console for details.")
+                     st.stop()
+
             except Exception as e:
-                st.error(f"⚠️ Prediction failed: {e}")
+                st.error(f"⚠️ An unexpected error occurred during prediction: {e}")
                 st.stop()
 
-        st.success(f"✅ Detection completed using method: {meta.get('used_method', 'Unknown')}")
+        # Assuming the prediction was successful and returned a DataFrame
+        st.success("✅ Detection completed.")
 
         # --- Summary Metrics ---
         st.subheader("📈 Detection Summary")
 
-        fraud_count = (out_df['Prediction_Label'] == 'Fraud').sum()
+        # Use the 'Predicted_Class' column added by predict_fraud
+        fraud_count = (out_df['Predicted_Class'] == 1).sum()
         total_count = len(out_df)
-        fraud_rate = (fraud_count / total_count) * 100
+        fraud_rate = (fraud_count / total_count) * 100 if total_count > 0 else 0
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -120,17 +116,15 @@ if uploaded_file is not None:
         with c3:
             st.markdown(f"<div class='metric-card'><div class='metric-value'>{fraud_rate:.2f}%</div><div class='metric-label'>Fraud Rate</div></div>", unsafe_allow_html=True)
 
-        # --- Probability Distribution ---
-        st.subheader("🔎 Fraud Probability Distribution")
-        st.bar_chart(out_df['Fraud_Probability'].value_counts(bins=20).sort_index())
-
         # --- Risky Transactions ---
-        risky = out_df[out_df['Prediction_Label'] == 'Fraud'].sort_values('Fraud_Probability', ascending=False)
+        # Filter based on 'Predicted_Class' == 1 and sort by 'Fraud_Probability'
+        risky = out_df[out_df['Predicted_Class'] == 1].sort_values('Fraud_Probability', ascending=False)
         st.subheader("🚨 Risky Transactions Detected")
         if not risky.empty:
-            st.dataframe(risky.head(50))
+            # Display relevant columns from the risky transactions
+            st.dataframe(risky[['Time', 'Amount'] + [f'V{i}' for i in range(1, 29)] + ['Predicted_Class', 'Fraud_Probability']].head(50))
         else:
-            st.success("🎉 No risky transactions detected at this threshold.")
+            st.success("🎉 No risky transactions detected.")
 
         # --- Download Results ---
         csv = out_df.to_csv(index=False).encode("utf-8")
