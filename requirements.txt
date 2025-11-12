@@ -1,6 +1,6 @@
 # requirements.txt
 streamlit
-torch==2.5.0
+torch==2.8.0
 pandas
 numpy
 scikit-learn
