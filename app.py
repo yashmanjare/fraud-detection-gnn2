@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 # Import the correct function name
-from prediction_function import predict_fraud
+# from prediction_function import predict_fraud
 
 # --- Streamlit Page Config ---
 st.set_page_config(
