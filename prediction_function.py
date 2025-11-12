@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from sklearn.preprocessing import StandardScaler
 from scipy.sparse import csr_matrix
-from torch_geometric.data import Data
+# from torch_geometric.data import Data
 import torch.nn.functional as F
 from torch.nn import Linear, Dropout
 from torch_geometric.nn import GCNConv
